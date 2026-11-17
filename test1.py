@@ -1,959 +1,604 @@
-#impact.py
-import tkinter as tk
-import os
-import math
+#msltest2.py
+import pygame
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
 import numpy as np
-import time
+import math
+import json
+import os
+from dataclasses import dataclass
 
-def snapshot_sim_data(sim_window, cache=None, selected_idx=0, go_trigger_time=0.0, selected_type="missile"):
-    if sim_window is None:
+# --- Simulation Constants ---
+EARTH_RADIUS = 6.371  # Normalized or scaled units (e.g., thousands of km)
+EARTH_RADIUS_KM = 6371.0
+TIME_STEP = 0.1
+
+
+@dataclass
+class SimulationConfig:
+    missile_speed: float = 0.05
+    interceptor_speed: float = 0.07
+    proportional_gain: float = 4.0
+    auto_launch_interceptor: bool = True
+    missile_start_lat: float = 39.0
+    missile_start_lon: float = 125.0
+    missile_start_altitude_km: float = 0.0
+    missile_target_lat: float = 38.0
+    missile_target_lon: float = -77.0
+    missile_target_altitude_km: float = 0.0
+    interceptor_start_lat: float = 64.0
+    interceptor_start_lon: float = -147.0
+    interceptor_start_altitude_km: float = 0.0
+    interceptor_delay_sec: float = 3.0
+    custom_cam_lat: float = 38.54
+    custom_cam_lon: float = 100.74
+    custom_cam_altitude_km: float = 0.5
+    custom_view_yaw_deg: float = 169.26
+    custom_view_pitch_deg: float = 38.54
+    missile_loft_factor: float = 0.8
+    missile_hit_radius: float = 0.0015
+    interceptor_hit_radius: float = 0.003
+    loft_vis_ratio: float = 1.0
+    spd_vis_ratio: float = 1.0
+
+
+def altitude_km_to_radius(altitude_km, base_radius=EARTH_RADIUS):
+    return base_radius * (1.0 + float(altitude_km) / EARTH_RADIUS_KM)
+
+
+def lat_lon_to_xyz(lat, lon, radius=EARTH_RADIUS, altitude_km=0.0):
+    """Converts latitude and longitude (in degrees) to 3D Cartesian coordinates."""
+    radius = altitude_km_to_radius(altitude_km, radius)
+    phi = math.radians(90 - lat)
+    theta = math.radians(lon)
+    x = radius * math.sin(phi) * math.cos(theta)
+    y = radius * math.cos(phi)
+    z = radius * math.sin(phi) * math.sin(theta)
+    return np.array([x, y, z], dtype=np.float32)
+
+
+def xyz_to_lat_lon(point):
+    radius = np.linalg.norm(point)
+    if radius < 1e-9:
         return None
-    if cache is None:
-        cache = {}
-    
-    missiles_snap = []
-    try:
-        for idx, msl in enumerate(sim_window.missiles):
-            geo_msl = sim_window.simulation_vector_to_geo_altitude(msl.pos)
-            geo_tgt = sim_window.simulation_vector_to_geo_altitude(msl.target)
-            
-            # Retrieve or initialize the cache for this missile
-            msl_id = id(msl)
-            if msl_id not in cache:
-                cache[msl_id] = []
-                
-            msl_cache = cache[msl_id]
-            # Convert only the NEW points
-            if hasattr(msl, "path"):
-                while len(msl_cache) < len(msl.path):
-                    pt = msl.path[len(msl_cache)]
-                    geo_pt = sim_window.simulation_vector_to_geo_altitude(pt)
-                    if geo_pt is not None:
-                        msl_cache.append([geo_pt[0], geo_pt[1]])
-                    else:
-                        msl_cache.append([0.0, 0.0]) # fallback
-                        
-            # Now downsample the pre-converted path
-            trail_coords = []
-            if len(msl_cache) > 1:
-                sample_rate = max(1, len(msl_cache) // 150)
-                sampled_path = msl_cache[::sample_rate]
-                if len(msl_cache) - 1 not in range(0, len(msl_cache), sample_rate):
-                    sampled_path.append(msl_cache[-1])
-                trail_coords = sampled_path
-            
-            missiles_snap.append({
-                "idx": idx,
-                "label": getattr(msl, "label", f"M{idx+1}"),
-                "geo_msl": geo_msl,
-                "geo_tgt": geo_tgt,
-                "trail_coords": trail_coords,
-                "active": msl.active,
-                "reached_target": getattr(msl, "reached_target", False)
-            })
-    except Exception as ex:
-        print("Error snapshotting missiles:", ex)
-        
-    interceptors_snap = []
-    try:
-        for idx, intcp in enumerate(sim_window.interceptors):
-            geo_intcp = sim_window.simulation_vector_to_geo_altitude(intcp.pos)
-            
-            # Retrieve or initialize the cache for this interceptor
-            intcp_id = id(intcp)
-            if intcp_id not in cache:
-                cache[intcp_id] = []
-                
-            intcp_cache = cache[intcp_id]
-            # Convert only the NEW points
-            if hasattr(intcp, "path"):
-                while len(intcp_cache) < len(intcp.path):
-                    pt = intcp.path[len(intcp_cache)]
-                    geo_pt = sim_window.simulation_vector_to_geo_altitude(pt)
-                    if geo_pt is not None:
-                        intcp_cache.append([geo_pt[0], geo_pt[1]])
-                    else:
-                        intcp_cache.append([0.0, 0.0]) # fallback
-                        
-            # Now downsample the pre-converted path
-            trail_coords = []
-            if len(intcp_cache) > 1:
-                sample_rate = max(1, len(intcp_cache) // 150)
-                sampled_path = intcp_cache[::sample_rate]
-                if len(intcp_cache) - 1 not in range(0, len(intcp_cache), sample_rate):
-                    sampled_path.append(intcp_cache[-1])
-                trail_coords = sampled_path
-                        
-            interceptors_snap.append({
-                "idx": idx,
-                "label": getattr(intcp, "label", f"Int{idx+1}"),
-                "geo_intcp": geo_intcp,
-                "trail_coords": trail_coords,
-                "active": intcp.active,
-                "hit": intcp.hit
-            })
-    except Exception as ex:
-        print("Error snapshotting interceptors:", ex)
-        
-    show_msl_lbl = getattr(sim_window, "show_msl_lbl_var", None).get() if hasattr(sim_window, "show_msl_lbl_var") else True
-    return {
-        "selected_idx": selected_idx,
-        "selected_type": selected_type,
-        "go_trigger_time": go_trigger_time,
-        "show_msl_lbl": show_msl_lbl,
-        "sim_elapsed_time": getattr(sim_window, "sim_elapsed_time", 0.0),
-        "missiles": missiles_snap,
-        "interceptors": interceptors_snap
-    }
+    lat = math.degrees(math.asin(float(point[1]) / radius))
+    lon = math.degrees(math.atan2(float(point[2]), float(point[0])))
+    return float(lat), float(lon)
 
-def save_json_atomic(data, filename):
-    import json
-    tmp_filename = filename + ".tmp"
-    try:
-        with open(tmp_filename, "w") as f:
-            json.dump(data, f)
-        if os.path.exists(tmp_filename):
-            try:
-                os.replace(tmp_filename, filename)
-            except PermissionError:
-                # On Windows, if WebView2 is fetching the file, ignore transient lock.
-                pass
-    except Exception:
-        pass
 
-def update_map_file(epicenter_lat, epicenter_lon, sim_window=None, msl_lat=None, msl_lon=None):
-    try:
-        import folium
-        import os
-        
-        for filename, zoom_level, use_restore in [("missile_warning_map.html", 11, True), ("local_zoom_map.html", 14, True)]:
-            m = folium.Map(location=[epicenter_lat, epicenter_lon], zoom_start=zoom_level, tiles="OpenStreetMap")
-            
-            # Ground zero marker (target) - drawn cleanly on its own without any impact circles
-            folium.Marker(
-                location=[epicenter_lat, epicenter_lon],
-                popup="<b>Ground Zero (Target Epicenter)</b>",
-                icon=folium.Icon(color="darkred", icon="warning", prefix="fa")
-            ).add_to(m)
-            
-            # Inject Custom Leaflet Javascript to persist zoom/drag and fetch live_data.json every 250ms dynamically!
-            js_persist_template = """
-            <script>
-            document.addEventListener("DOMContentLoaded", function() {
-                setTimeout(function() {
-                    var maps = Object.keys(window).filter(k => k.startsWith("map_") && window[k] instanceof L.Map);
-                    if (maps.length > 0) {
-                        var map = window[maps[0]];
-                        
-                        __RESTORE_LOGIC__
-                        
-                        // ------------------ REAL-TIME CLIENT-SIDE UPDATE LOOP ------------------
-                        var dynamicLayers = [];
-                        var epicenter_lat = __EPICENTER_LAT__;
-                        var epicenter_lon = __EPICENTER_LON__;
-                        
-                        function updateLiveMap() {
-                            fetch("./live_data.json?t=" + new Date().getTime())
-                                .then(response => response.json())
-                                .then(data => {
-                                    __GO_TRIGGER_LOGIC__
+def draw_sphere(radius, longitudinal_lines=24, latitudinal_lines=24):
+    """Draws a wireframe sphere representing the Earth."""
+    glColor3f(0.3, 0.3, 0.3)
+    for i in range(latitudinal_lines + 1):
+        lat = -90 + i * (180 / latitudinal_lines)
+        glBegin(GL_LINE_LOOP)
+        for j in range(longitudinal_lines):
+            lon = j * (360 / longitudinal_lines)
+            glVertex3fv(lat_lon_to_xyz(lat, lon, radius))
+        glEnd()
 
-                                    // 1. Clear old dynamic layers
-                                    dynamicLayers.forEach(layer => map.removeLayer(layer));
-                                    dynamicLayers = [];
-                                    
-                                    // 2. Render missiles and trails
-                                    if (data.missiles) {
-                                        data.missiles.forEach((msl) => {
-                                            var idx = msl.idx;
-                                            var geo_msl = msl.geo_msl;
-                                            var geo_tgt = msl.geo_tgt;
-                                            var trail_coords = msl.trail_coords;
-                                            var active = msl.active;
-                                            var reached_target = msl.reached_target;
-                                            
-                                            // Determine status
-                                            var is_intercepted = data.interceptors && data.interceptors.some(i => i.idx === idx && i.hit);
-                                            
-                                            // Draw circles and missile marker if active or waiting on launch pad
-                                            if (geo_msl && (active || (!active && !reached_target))) {
-                                                var lat = geo_msl[0];
-                                                var lon = geo_msl[1];
-                                                var alt = geo_msl[2];
-                                                
-                                                // Only draw danger warning circles if the missile is active in flight
-                                                if (active) {
-                                                    // Circle 15km (Yellow)
-                                                    var c1 = L.circle([lat, lon], {radius: 15000, color: "yellow", weight: 1.5, fill: true, fillColor: "yellow", fillOpacity: 0.12});
-                                                    c1.bindTooltip("M" + (idx+1) + " Low Risk: Watch");
-                                                    c1.addTo(map);
-                                                    dynamicLayers.push(c1);
-                                                    
-                                                    // Circle 8km (Orange)
-                                                    var c2 = L.circle([lat, lon], {radius: 8000, color: "orange", weight: 1.5, fill: true, fillColor: "orange", fillOpacity: 0.28});
-                                                    c2.bindTooltip("M" + (idx+1) + " Med Risk: Fragment");
-                                                    c2.addTo(map);
-                                                    dynamicLayers.push(c2);
-                                                    
-                                                    // Circle 3km (Red)
-                                                    var c3 = L.circle([lat, lon], {radius: 3000, color: "red", weight: 1.5, fill: true, fillColor: "red", fillOpacity: 0.45});
-                                                    c3.bindTooltip("M" + (idx+1) + " High Risk: Blast");
-                                                    c3.addTo(map);
-                                                    dynamicLayers.push(c3);
-                                                }
-                                                
-                                                // Missile Marker
-                                                var mIcon = L.AwesomeMarkers.icon({icon: 'plane', markerColor: 'red', prefix: 'fa'});
-                                                var marker = L.marker([lat, lon], {icon: mIcon});
-                                                marker.bindPopup("<b>Incoming Missile " + (idx+1) + " (Alt: " + alt.toFixed(1) + "km)</b>");
-                                                if (data.show_msl_lbl !== false) {
-                                                    marker.bindTooltip(msl.label || "M" + (idx+1), {permanent: true, direction: "top", offset: [0, -5], className: "missile-tooltip"});
-                                                }
-                                                marker.addTo(map);
-                                                dynamicLayers.push(marker);
-                                            }
-                                            
-                                            // Draw trail
-                                            if (trail_coords && trail_coords.length > 1) {
-                                                var solid_segment = [];
-                                                for (var i = 0; i < trail_coords.length; i++) {
-                                                    var p = trail_coords[i];
-                                                    if (solid_segment.length === 0) {
-                                                        solid_segment.push(p);
-                                                    } else {
-                                                        var last_p = solid_segment[solid_segment.length - 1];
-                                                        if (Math.abs(p[1] - last_p[1]) > 180) {
-                                                            if (solid_segment.length > 1) {
-                                                                var line = L.polyline(solid_segment, {color: "red", weight: 3, opacity: 0.8});
-                                                                line.addTo(map);
-                                                                dynamicLayers.push(line);
-                                                            }
-                                                            var dashLine = L.polyline([last_p, p], {color: "#ff6b6b", weight: 1.5, dashArray: "5, 5", opacity: 0.5});
-                                                            dashLine.addTo(map);
-                                                            dynamicLayers.push(dashLine);
-                                                            solid_segment = [p];
-                                                        } else {
-                                                            solid_segment.push(p);
-                                                        }
-                                                    }
-                                                }
-                                                if (solid_segment.length > 1) {
-                                                    var line = L.polyline(solid_segment, {color: "red", weight: 3, opacity: 0.8});
-                                                    line.addTo(map);
-                                                    dynamicLayers.push(line);
-                                                }
-                                            }
-                                            
-                                            // Draw status icons
-                                            if (is_intercepted && trail_coords && trail_coords.length > 0) {
-                                                var loc = trail_coords[trail_coords.length - 1];
-                                                var fIcon = L.AwesomeMarkers.icon({icon: 'fire', markerColor: 'orange', prefix: 'fa'});
-                                                var fMarker = L.marker(loc, {icon: fIcon});
-                                                fMarker.bindPopup("<b>Missile " + (idx+1) + " INTERCEPTED (SUCCESS)</b>");
-                                                if (data.show_msl_lbl !== false) {
-                                                    fMarker.bindTooltip((msl.label || "M" + (idx+1)) + " (Intercepted)", {permanent: true, direction: "top", offset: [0, -5], className: "missile-tooltip"});
-                                                }
-                                                fMarker.addTo(map);
-                                                dynamicLayers.push(fMarker);
-                                            } else if (reached_target && geo_tgt) {
-                                                var loc = [geo_tgt[0], geo_tgt[1]];
-                                                var bIcon = L.AwesomeMarkers.icon({icon: 'bomb', markerColor: 'red', prefix: 'fa'});
-                                                var bMarker = L.marker(loc, {icon: bIcon});
-                                                bMarker.bindPopup("<b>Missile " + (idx+1) + " IMPACT (FAILURE)</b>");
-                                                if (data.show_msl_lbl !== false) {
-                                                    bMarker.bindTooltip((msl.label || "M" + (idx+1)) + " (Detonated)", {permanent: true, direction: "top", offset: [0, -5], className: "missile-tooltip"});
-                                                }
-                                                bMarker.addTo(map);
-                                                dynamicLayers.push(bMarker);
-                                            }
-                                            
-                                            // Draw Target (if not hit)
-                                            if (!reached_target && geo_tgt) {
-                                                var tgt_lat = geo_tgt[0];
-                                                var tgt_lon = geo_tgt[1];
-                                                if (Math.abs(tgt_lat - epicenter_lat) > 1e-4 || Math.abs(tgt_lon - epicenter_lon) > 1e-4) {
-                                                    var tIcon = L.AwesomeMarkers.icon({icon: 'crosshairs', markerColor: 'green', prefix: 'fa'});
-                                                    var tMarker = L.marker([tgt_lat, tgt_lon], {icon: tIcon});
-                                                    tMarker.bindPopup("<b>Missile " + (idx+1) + " Target</b>");
-                                                    if (data.show_msl_lbl !== false) {
-                                                        tMarker.bindTooltip((msl.label || "M" + (idx+1)) + " Target", {permanent: true, direction: "top", offset: [0, -5], className: "target-tooltip"});
-                                                    }
-                                                    tMarker.addTo(map);
-                                                    dynamicLayers.push(tMarker);
-                                                }
-                                            }
-                                        });
-                                    }
-                                    
-                                    // 3. Render interceptors and trails
-                                    if (data.interceptors) {
-                                        data.interceptors.forEach((intcp) => {
-                                            var idx = intcp.idx;
-                                            var geo_intcp = intcp.geo_intcp;
-                                            var trail_coords = intcp.trail_coords;
-                                            var active = intcp.active;
-                                            var hit = intcp.hit;
-                                            
-                                            // Draw interceptor marker if active or waiting on launcher
-                                            if (geo_intcp && (active || (!active && !hit))) {
-                                                var lat = geo_intcp[0];
-                                                var lon = geo_intcp[1];
-                                                var alt = geo_intcp[2];
-                                                
-                                                var rIcon = L.AwesomeMarkers.icon({icon: 'rocket', markerColor: 'blue', prefix: 'fa'});
-                                                var rMarker = L.marker([lat, lon], {icon: rIcon});
-                                                rMarker.bindPopup("<b>Interceptor " + (idx+1) + " (Alt: " + alt.toFixed(1) + "km)</b>");
-                                                if (data.show_msl_lbl !== false) {
-                                                    rMarker.bindTooltip(intcp.label || "Int" + (idx+1), {permanent: true, direction: "top", offset: [0, -5], className: "interceptor-tooltip"});
-                                                }
-                                                rMarker.addTo(map);
-                                                dynamicLayers.push(rMarker);
-                                            }
-                                            
-                                            if (trail_coords && trail_coords.length > 1) {
-                                                var solid_segment = [];
-                                                for (var i = 0; i < trail_coords.length; i++) {
-                                                    var p = trail_coords[i];
-                                                    if (solid_segment.length === 0) {
-                                                        solid_segment.push(p);
-                                                    } else {
-                                                        var last_p = solid_segment[solid_segment.length - 1];
-                                                        if (Math.abs(p[1] - last_p[1]) > 180) {
-                                                            if (solid_segment.length > 1) {
-                                                                var line = L.polyline(solid_segment, {color: "blue", weight: 3, opacity: 0.8});
-                                                                line.addTo(map);
-                                                                dynamicLayers.push(line);
-                                                            }
-                                                            var dashLine = L.polyline([last_p, p], {color: "#819ff7", weight: 1.5, dashArray: "5, 5", opacity: 0.5});
-                                                            dashLine.addTo(map);
-                                                            dynamicLayers.push(dashLine);
-                                                            solid_segment = [p];
-                                                        } else {
-                                                            solid_segment.push(p);
-                                                        }
-                                                    }
-                                                }
-                                                if (solid_segment.length > 1) {
-                                                    var line = L.polyline(solid_segment, {color: "blue", weight: 3, opacity: 0.8});
-                                                    line.addTo(map);
-                                                    dynamicLayers.push(line);
-                                                }
-                                            }
-                                        });
-                                    }
-                                })
-                                .catch(err => console.log("Error loading live data:", err));
-                        }
-                        
-                        setInterval(updateLiveMap, 250);
-                    }
-                }, 150);
-            });
-            </script>
-            """
-            
-            # Determine unique localStorage keys based on map type (global vs local)
-            lat_key = "global_map_lat" if zoom_level == 11 else "local_map_lat"
-            lon_key = "global_map_lon" if zoom_level == 11 else "local_map_lon"
-            zoom_key = "global_map_zoom" if zoom_level == 11 else "local_map_zoom"
+    for j in range(longitudinal_lines):
+        glBegin(GL_LINE_STRIP)
+        for i in range(latitudinal_lines + 1):
+            lat = -90 + i * (180 / latitudinal_lines)
+            lon = j * (360 / longitudinal_lines)
+            glVertex3fv(lat_lon_to_xyz(lat, lon, radius))
+        glEnd()
 
-            # Both maps now have their own independent, persistent saved coordinate/zoom settings!
-            restore_logic = ""
-            if use_restore:
-                restore_logic = """
-                var savedLat = localStorage.getItem("__LAT_KEY__");
-                var savedLon = localStorage.getItem("__LON_KEY__");
-                var savedZoom = localStorage.getItem("__ZOOM_KEY__");
-                
-                if (savedLat && savedLon && savedZoom) {
-                    map.setView([parseFloat(savedLat), parseFloat(savedLon)], parseInt(savedZoom), {animate: false});
-                }
-                
-                map.on("moveend", function() {
-                    var center = map.getCenter();
-                    localStorage.setItem("__LAT_KEY__", center.lat);
-                    localStorage.setItem("__LON_KEY__", center.lng);
-                });
-                map.on("zoomend", function() {
-                    localStorage.setItem("__ZOOM_KEY__", map.getZoom());
-                });
-                """.replace("__LAT_KEY__", lat_key) \
-                   .replace("__LON_KEY__", lon_key) \
-                   .replace("__ZOOM_KEY__", zoom_key)
-                
-            # Populate go-trigger logic (only for embedded local zoom map!)
-            go_trigger_logic = ""
-            if zoom_level == 14:
-                go_trigger_logic = """
-                                    // 0. Auto-center on selected index current position or target (Ground Zero local zoom map)
-                                    var selectedIdx = data.selected_idx || 0;
-                                    var lat, lon;
-                                    if (data.selected_type === "interceptor") {
-                                        var selectedIntcp = data.interceptors && data.interceptors.find(i => i.idx === selectedIdx);
-                                        if (selectedIntcp && selectedIntcp.geo_intcp) {
-                                            lat = selectedIntcp.geo_intcp[0];
-                                            lon = selectedIntcp.geo_intcp[1];
-                                        }
-                                    } else if (data.selected_type === "target") {
-                                        var selectedMsl = data.missiles && data.missiles.find(m => m.idx === selectedIdx);
-                                        if (selectedMsl && selectedMsl.geo_tgt) {
-                                            lat = selectedMsl.geo_tgt[0];
-                                            lon = selectedMsl.geo_tgt[1];
-                                        }
-                                    } else { // missile
-                                        var selectedMsl = data.missiles && data.missiles.find(m => m.idx === selectedIdx);
-                                        if (selectedMsl && selectedMsl.geo_msl) {
-                                            lat = selectedMsl.geo_msl[0];
-                                            lon = selectedMsl.geo_msl[1];
-                                        }
-                                    }
-                                    
-                                    // Handle manual Go-trigger or selection change centering
-                                    if (lat !== undefined && lon !== undefined && data.go_trigger_time && window.last_go_trigger !== data.go_trigger_time) {
-                                        window.last_go_trigger = data.go_trigger_time;
-                                        map.setView([lat, lon], map.getZoom(), {animate: true});
-                                    }
-                """
-                
-            js_persist = js_persist_template.replace("__RESTORE_LOGIC__", restore_logic) \
-                                             .replace("__GO_TRIGGER_LOGIC__", go_trigger_logic) \
-                                             .replace("__EPICENTER_LAT__", str(epicenter_lat)) \
-                                             .replace("__EPICENTER_LON__", str(epicenter_lon)) \
-                                             .replace("__ZOOM_LEVEL__", str(zoom_level))
-                                             
-            m.get_root().html.add_child(folium.Element(js_persist))
-            
-            css_style = """
-            <style>
-            .awesome-marker {
-                transform: scale(0.5) !important;
-                transform-origin: 50% 100% !important;
-            }
-            .awesome-marker-shadow {
-                transform: scale(0.5) !important;
-                transform-origin: 50% 100% !important;
-            }
-            .leaflet-tooltip {
-                background-color: transparent !important;
-                border: none !important;
-                box-shadow: none !important;
-                font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif !important;
-                font-weight: 400 !important;
-                font-size: 11px !important;
-                white-space: nowrap !important;
-                text-rendering: optimizeLegibility !important;
-                -webkit-font-smoothing: antialiased !important;
-                -moz-osx-font-smoothing: grayscale !important;
-                text-shadow: 1px 1px 0px #000 !important;
-            }
-            .leaflet-tooltip:before {
-                display: none !important;
-            }
-            .missile-tooltip {
-                color: #ff3333 !important; /* Bright red matching missiles/trails */
-            }
-            .interceptor-tooltip {
-                color: #3399ff !important; /* Bright blue matching interceptors/trails */
-            }
-            .target-tooltip {
-                color: #2ecc71 !important; /* Bright green matching targets */
-            }
-            </style>
-            """
-            m.get_root().header.add_child(folium.Element(css_style))
-            
-            # Save file atomically
-            tmp_name = filename + ".tmp"
-            m.save(tmp_name)
-            if os.path.exists(tmp_name):
-                os.replace(tmp_name, filename)
-    except Exception as e:
-        print("Error regenerating maps:", e)
 
-class MissileImpactWarningWindow(tk.Toplevel):
-    def __init__(self, parent, impact_lat, impact_lon, sim_window):
-        super().__init__(parent)
-        self.title("Missile Impact Warning")
-        self.load_window_settings()
-        self.configure(bg="#0c0f1d")
-        self.resizable(False, False)
-        
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        
-        self.impact_lat = impact_lat
-        self.impact_lon = impact_lon
-        self.sim_window = sim_window
-        
-        self.flash_state = True
-        self.explosion_drawn = False
-        self.last_map_update_time = 0.0
-        self.map_update_in_progress = False
-        self.geo_path_cache = {}
-        self.go_trigger_time = 0.0
-        
-        # Determine initial selection (find first active missile if any, otherwise default to 0)
-        self.selected_msl_idx = 0
-        self.selected_type = "missile"
-        if self.sim_window is not None and hasattr(self.sim_window, "missiles"):
-            for idx, msl in enumerate(self.sim_window.missiles):
-                if msl.active:
-                    self.selected_msl_idx = idx
-                    break
-        
-        # Generate static missile_warning_map.html once on startup
-        update_map_file(self.impact_lat, self.impact_lon, self.sim_window)
-        
-        # Write initial real-time live_data.json snapshot
-        snap = snapshot_sim_data(self.sim_window, self.geo_path_cache, self.selected_msl_idx, self.go_trigger_time, self.selected_type)
-        save_json_atomic(snap or {}, "live_data.json")
-        
-        self.build_ui()
-        self.update() # Force Tkinter geometry updates to set initial canvas width/height
-        
-        # Start reparenting function after 1 second
-        self.after(1000, self.reparent_map)
-        
-        self.update_loop()
-        
-    def build_ui(self):
-        # 1. Header Banner
-        self.header_frm = tk.Frame(self, bg="#c0392b", pady=8)
-        self.header_frm.pack(fill="x")
-        
-        self.header_lbl = tk.Label(
-            self.header_frm, 
-            text="🚨 TACTICAL IMPACT WARNING SYSTEM 🚨", 
-            font=("Segoe UI", 12, "bold"), 
-            fg="#ffffff", 
-            bg="#c0392b"
+def draw_location_marker(lat, lon, color, altitude_km=0.0, radius_scale=1.04):
+    base = lat_lon_to_xyz(lat, lon, EARTH_RADIUS)
+    altitude_km = max(float(altitude_km), 0.0)
+    visual_altitude_km = 0.0 if altitude_km == 0.0 else min(40.0 + math.sqrt(altitude_km) * 18.0, 320.0)
+    marker_radius = altitude_km_to_radius(visual_altitude_km, EARTH_RADIUS)
+    point = lat_lon_to_xyz(lat, lon, marker_radius)
+    glColor3f(*color)
+    if visual_altitude_km > 0.0:
+        stem_point = lat_lon_to_xyz(lat, lon, altitude_km_to_radius(visual_altitude_km, EARTH_RADIUS * radius_scale))
+        glLineWidth(2.0)
+        glBegin(GL_LINES)
+        glVertex3fv(base)
+        glVertex3fv(stem_point)
+        glEnd()
+    glPointSize(10.0 if altitude_km == 0.0 else 12.0)
+    glBegin(GL_POINTS)
+    glVertex3fv(point)
+    glEnd()
+
+
+def intersect_ray_with_sphere(ray_origin, ray_dir, radius):
+    a = float(np.dot(ray_dir, ray_dir))
+    b = 2.0 * float(np.dot(ray_origin, ray_dir))
+    c = float(np.dot(ray_origin, ray_origin) - radius * radius)
+    discriminant = b * b - 4.0 * a * c
+    if discriminant < 0.0:
+        return None
+    sqrt_disc = math.sqrt(discriminant)
+    roots = [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)]
+    hits = [t for t in roots if t >= 0.0]
+    if not hits:
+        return None
+    return ray_origin + ray_dir * min(hits)
+
+
+def unproject_point(win_x, win_y, win_z, modelview, projection, viewport):
+    x_ndc = 2.0 * (win_x - viewport[0]) / viewport[2] - 1.0
+    y_ndc = 2.0 * (win_y - viewport[1]) / viewport[3] - 1.0
+    z_ndc = 2.0 * win_z - 1.0
+    clip = np.array([x_ndc, y_ndc, z_ndc, 1.0], dtype=float)
+    inv = np.linalg.inv(projection @ modelview)
+    world = inv @ clip
+    if abs(world[3]) < 1e-9:
+        return None
+    return world[:3] / world[3]
+
+
+def pick_point_on_globe(title, initial_lat, initial_lon):
+    pygame.init()
+    display = (1024, 768)
+    pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
+
+    glEnable(GL_DEPTH_TEST)
+    gluPerspective(45, display[0] / display[1], 0.1, 50.0)
+
+    clock = pygame.time.Clock()
+    rotation_x = 24.0
+    rotation_y = -58.0
+    zoom = -18.0
+    dragging = False
+    selected_lat = float(initial_lat)
+    selected_lon = float(initial_lon)
+
+    running = True
+    picked_value = None
+    while running:
+        pygame.display.set_caption(
+            f"{title} | Lat {selected_lat:.2f}, Lon {selected_lon:.2f} | Right-drag rotate | Wheel zoom | Left-click pick | Esc cancel"
         )
-        self.header_lbl.pack(anchor="center")
-        
-        # 2. Hazard Map Canvas
-        self.canvas_frm = tk.LabelFrame(
-            self, 
-            text=" Target Area Hazard Map (Ground Zero) ", 
-            fg="#3498db", 
-            bg="#0c0f1d", 
-            font=("Segoe UI", 9, "bold"), 
-            bd=1, 
-            relief="solid"
-        )
-        self.canvas_frm.pack(fill="both", expand=True, padx=20, pady=15)
-        
-        self.canvas = tk.Canvas(self.canvas_frm, bg="#080b15", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        # Bind resize helper to draw concentric hazard rings
-        self.canvas.bind("<Configure>", self.draw_hazard_map)
-        
-        # 3. Telemetry Status Dashboard Panel
-        self.dash_frm = tk.LabelFrame(
-            self, 
-            text=" Dynamic Telemetry Feed ", 
-            fg="#e74c3c", 
-            bg="#0c0f1d", 
-            font=("Segoe UI", 9, "bold"), 
-            bd=1, 
-            relief="solid",
-            padx=15,
-            pady=12
-        )
-        self.dash_frm.pack(fill="x", padx=20, pady=(0, 15))
-        
-        # Grid layout for telemetry values
-        # Row 1: Threat Profile
-        tk.Label(self.dash_frm, text="Threat Profile:", font=("Segoe UI", 9, "bold"), fg="#8892b0", bg="#0c0f1d").grid(row=0, column=0, sticky="w", pady=4)
-        
-        from tkinter import ttk
-        self.msl_var = tk.StringVar()
-        self.msl_combo = ttk.Combobox(self.dash_frm, textvariable=self.msl_var, state="readonly", width=35)
-        self.msl_combo.grid(row=0, column=1, sticky="w", padx=10, pady=4)
-        self.msl_combo.bind("<<ComboboxSelected>>", self.on_missile_selected)
-        
-        # Populate initial list of values statically once (include all missiles, interceptors, and targets!)
-        self.combo_mapping = []
-        display_values = []
-        initial_combo_idx = 0
-        
-        if self.sim_window is not None:
-            # Missiles
-            if hasattr(self.sim_window, "missiles"):
-                for idx, msl in enumerate(self.sim_window.missiles):
-                    label = getattr(msl, "label", f"M{idx+1}")
-                    display_values.append(f"Missile {idx+1}: {label}")
-                    self.combo_mapping.append(("missile", idx))
-                    if self.selected_type == "missile" and self.selected_msl_idx == idx:
-                        initial_combo_idx = len(display_values) - 1
-            # Interceptors
-            if hasattr(self.sim_window, "interceptors"):
-                for idx, intcp in enumerate(self.sim_window.interceptors):
-                    label = getattr(intcp, "label", f"Int{idx+1}")
-                    display_values.append(f"Interceptor {idx+1}: {label}")
-                    self.combo_mapping.append(("interceptor", idx))
-                    if self.selected_type == "interceptor" and self.selected_msl_idx == idx:
-                        initial_combo_idx = len(display_values) - 1
-            # Targets
-            if hasattr(self.sim_window, "missiles"):
-                for idx, msl in enumerate(self.sim_window.missiles):
-                    label = getattr(msl, "target_label", f"T{idx+1}")
-                    display_values.append(f"Target {idx+1}: {label}")
-                    self.combo_mapping.append(("target", idx))
-                    if self.selected_type == "target" and self.selected_msl_idx == idx:
-                        initial_combo_idx = len(display_values) - 1
-                        
-        self.msl_combo["values"] = display_values
-        if len(display_values) > 0:
-            self.msl_combo.current(initial_combo_idx)
-        
-        # Row 2: Epicenter
-        tk.Label(self.dash_frm, text="Impact Epicenter:", font=("Segoe UI", 9, "bold"), fg="#8892b0", bg="#0c0f1d").grid(row=1, column=0, sticky="w", pady=4)
-        self.epicenter_lbl = tk.Label(self.dash_frm, text=f"Lat {self.impact_lat:.4f}°, Lon {self.impact_lon:.4f}°", font=("Segoe UI", 9, "bold"), fg="#ffffff", bg="#0c0f1d")
-        self.epicenter_lbl.grid(row=1, column=1, sticky="w", padx=10, pady=4)
-        
-        # Row 3: Missile Position (Vibrant Real-Time tracking coordinates!)
-        tk.Label(self.dash_frm, text="Missile Position:", font=("Segoe UI", 9, "bold"), fg="#8892b0", bg="#0c0f1d").grid(row=2, column=0, sticky="w", pady=4)
-        self.msl_pos_lbl = tk.Label(self.dash_frm, text="Offline", font=("Segoe UI", 9, "bold"), fg="#ffd54f", bg="#0c0f1d")
-        self.msl_pos_lbl.grid(row=2, column=1, sticky="w", padx=10, pady=4)
-        
-        self.go_btn = tk.Button(
-            self.dash_frm, 
-            text="Go", 
-            command=self.on_go_clicked, 
-            font=("Segoe UI", 8, "bold"), 
-            fg="#ffffff", 
-            bg="#3498db", 
-            activebackground="#2980b9", 
-            activeforeground="#ffffff", 
-            bd=0, 
-            padx=10, 
-            pady=2
-        )
-        self.go_btn.grid(row=2, column=2, sticky="e", padx=(15, 0), pady=4)
-        
-        # Row 4: Range to Impact
-        tk.Label(self.dash_frm, text="Range to Impact:", font=("Segoe UI", 9, "bold"), fg="#8892b0", bg="#0c0f1d").grid(row=3, column=0, sticky="w", pady=4)
-        self.range_lbl = tk.Label(self.dash_frm, text="--- km", font=("Segoe UI", 10, "bold"), fg="#ffd54f", bg="#0c0f1d")
-        self.range_lbl.grid(row=3, column=1, sticky="w", padx=10, pady=4)
-        
-        # Row 5: Countdown
-        tk.Label(self.dash_frm, text="Time to Impact:", font=("Segoe UI", 9, "bold"), fg="#8892b0", bg="#0c0f1d").grid(row=4, column=0, sticky="w", pady=4)
-        self.countdown_lbl = tk.Label(self.dash_frm, text="--- s", font=("Segoe UI", 12, "bold"), fg="#ff3333", bg="#0c0f1d")
-        self.countdown_lbl.grid(row=4, column=1, sticky="w", padx=10, pady=4)
-        
-        # Row 6: Operational Status
-        tk.Label(self.dash_frm, text="System Status:", font=("Segoe UI", 9, "bold"), fg="#8892b0", bg="#0c0f1d").grid(row=5, column=0, sticky="w", pady=4)
-        self.status_lbl = tk.Label(self.dash_frm, text="TRACKING", font=("Segoe UI", 9, "bold"), fg="#ff9f43", bg="#0c0f1d")
-        self.status_lbl.grid(row=5, column=1, sticky="w", padx=10, pady=4)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 3:
+                    dragging = True
+                elif event.button == 1:
+                    viewport = np.array(glGetIntegerv(GL_VIEWPORT), dtype=float)
+                    modelview = np.array(glGetDoublev(GL_MODELVIEW_MATRIX), dtype=float)
+                    projection = np.array(glGetDoublev(GL_PROJECTION_MATRIX), dtype=float)
+                    win_x = float(event.pos[0])
+                    win_y = float(viewport[3] - event.pos[1])
+                    near = unproject_point(win_x, win_y, 0.0, modelview, projection, viewport)
+                    far = unproject_point(win_x, win_y, 1.0, modelview, projection, viewport)
+                    if near is not None and far is not None:
+                        ray_dir = far - near
+                        norm = np.linalg.norm(ray_dir)
+                        if norm > 1e-9:
+                            ray_dir /= norm
+                            hit = intersect_ray_with_sphere(near, ray_dir, EARTH_RADIUS)
+                            if hit is not None:
+                                geo = xyz_to_lat_lon(hit)
+                                if geo is not None:
+                                    selected_lat, selected_lon = geo
+                                    picked_value = (selected_lat, selected_lon)
+                                    running = False
+                elif event.button == 4:
+                    zoom = min(zoom + 0.8, -8.0)
+                elif event.button == 5:
+                    zoom = max(zoom - 0.8, -32.0)
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+                dragging = False
+            elif event.type == pygame.MOUSEMOTION and dragging:
+                dx, dy = event.rel
+                rotation_y += dx * 0.35
+                rotation_x = max(min(rotation_x + dy * 0.25, 89.0), -89.0)
 
-    def reparent_map(self):
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            
-            # Find the pywebview window
-            hwnd_child = user32.FindWindowW(None, "Target Area Zoom Map")
-            if hwnd_child:
-                hwnd_parent = self.canvas.winfo_id()
-                
-                # Get current style
-                style = user32.GetWindowLongW(hwnd_child, -16) # GWL_STYLE
-                # Remove caption (title bar) and thick frame/border, set WS_CHILD style
-                new_style = (style & ~0x00C00000 & ~0x00040000) | 0x40000000 # WS_CHILD
-                user32.SetWindowLongW(hwnd_child, -16, new_style)
-                
-                # Reparent
-                user32.SetParent(hwnd_child, hwnd_parent)
-                
-                # Position it inside self.canvas
-                w = self.canvas.winfo_width()
-                h = self.canvas.winfo_height()
-                if w <= 1: w = 520
-                if h <= 1: h = 380
-                user32.MoveWindow(hwnd_child, 0, 0, w, h, True)
-                user32.ShowWindow(hwnd_child, 5) # SW_SHOW
-                
-                self.embedded_hwnd = hwnd_child
-            else:
-                # Retry in 500ms
-                self.after(500, self.reparent_map)
-        except Exception as e:
-            print("Error reparenting map:", e)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glLoadIdentity()
+        glTranslatef(0.0, 0.0, zoom)
+        glRotatef(rotation_x, 1.0, 0.0, 0.0)
+        glRotatef(rotation_y, 0.0, 1.0, 0.0)
 
-    def draw_hazard_map(self, event=None):
-        self.canvas.delete("all")
-        w = event.width if event is not None else self.canvas.winfo_width()
-        h = event.height if event is not None else self.canvas.winfo_height()
-        
-        if hasattr(self, "embedded_hwnd") and self.embedded_hwnd:
-            try:
-                import ctypes
-                user32 = ctypes.windll.user32
-                # Move and resize the embedded pywebview window to perfectly match the Canvas size
-                user32.MoveWindow(self.embedded_hwnd, 0, 0, w, h, True)
-            except Exception as e:
-                print("Error resizing embedded map:", e)
+        draw_sphere(EARTH_RADIUS)
+        draw_location_marker(selected_lat, selected_lon, (1.0, 0.9, 0.0), radius_scale=1.06)
 
-    def update_loop(self):
-        try:
-            # Check if simulation window exists
-            if self.sim_window is not None and self.sim_window.root.winfo_exists():
-                self.synchronize_states()
-        except Exception as e:
-            print("Error synchronizing impact warning:", e)
-            
-        # Alarm flashing effect (toggled only for logical states, not header coloring)
-        self.flash_state = not self.flash_state
-        
-        # Check every 100ms
-        self.after(100, self.update_loop)
+        pygame.display.flip()
+        clock.tick(60)
 
-    def on_missile_selected(self, event=None):
-        combo_sel = self.msl_combo.current()
-        if combo_sel != -1 and combo_sel < len(self.combo_mapping):
-            self.selected_type, self.selected_msl_idx = self.combo_mapping[combo_sel]
-        self.canvas.delete("explosion")
-        self.canvas.delete("threat_dot")
-        self.canvas.delete("hazard_rings")
-        self.explosion_drawn = False
-        self.synchronize_states()
+    pygame.display.quit()
+    return picked_value
 
-    def on_go_clicked(self):
-        self.go_trigger_time = time.time()
-        # Force an immediate update of live_data.json with the new trigger time
-        snap = snapshot_sim_data(self.sim_window, self.geo_path_cache, self.selected_msl_idx, self.go_trigger_time, self.selected_type)
-        save_json_atomic(snap or {}, "live_data.json")
 
-    def synchronize_states(self):
-        # Default initialization
-        if self.sim_window is None or not hasattr(self.sim_window, "missiles") or len(self.sim_window.missiles) == 0:
+class TargetMissile:
+    def __init__(self, start_lat, start_lon, start_altitude_km, target_lat, target_lon, target_altitude_km, speed, loft_factor=0.8, hit_radius=0.0015):
+        self.pos = lat_lon_to_xyz(start_lat, start_lon, altitude_km=start_altitude_km)
+        self.target = lat_lon_to_xyz(target_lat, target_lon, altitude_km=target_altitude_km)
+        self.speed = speed
+        self.loft_factor = loft_factor
+        self.hit_radius = hit_radius
+        self.path = [np.copy(self.pos)]
+        self.active = True
+        self.reached_target = False
+
+    def update(self):
+        if not self.active:
+            return False
+
+        direction = self.target - self.pos
+        distance = np.linalg.norm(direction)
+        if distance < self.hit_radius:
+            self.active = False
+            self.reached_target = True
+            return True
+
+        direction /= distance
+        center_dir = self.pos / np.linalg.norm(self.pos)
+        ratio = max(0.0, 1.0 - distance / EARTH_RADIUS)
+        loft_force = center_dir * self.speed * self.loft_factor * math.sin(math.pi * ratio)
+        self.pos += (direction * self.speed + loft_force) * TIME_STEP
+        self.path.append(np.copy(self.pos))
+        return False
+
+    def draw(self):
+        glColor3f(1.0, 0.0, 0.0)
+        glLineWidth(3.0)
+        glBegin(GL_LINE_STRIP)
+        for p in self.path:
+            glVertex3fv(p)
+        glEnd()
+        glPointSize(12.0)
+        glBegin(GL_POINTS)
+        glVertex3fv(self.pos)
+        glEnd()
+        glLineWidth(1.0)
+
+
+class Interceptor:
+    def __init__(self, start_lat, start_lon, start_altitude_km, speed, proportional_gain, hit_radius=0.003):
+        self.pos = lat_lon_to_xyz(start_lat, start_lon, altitude_km=start_altitude_km)
+        self.path = [np.copy(self.pos)]
+        self.vel = np.array([0.0, 0.0, 0.0])
+        self.speed = speed
+        self.proportional_gain = proportional_gain
+        self.hit_radius = hit_radius
+        self.active = False
+        self.hit = False
+
+    def launch(self):
+        self.active = True
+
+    def update(self, target_pos):
+        if not self.active or self.hit:
             return
 
-        if not hasattr(self, "selected_type"):
-            self.selected_type = "missile"
-        if not hasattr(self, "selected_msl_idx"):
-            self.selected_msl_idx = 0
+        los = target_pos - self.pos
+        distance = np.linalg.norm(los)
+        if distance < self.hit_radius:
+            self.hit = True
+            print("Intercept successful!")
+            return
 
-        # Retrieve entities
-        active_msl = self.sim_window.missiles[self.selected_msl_idx]
-        active_intcp = self.sim_window.interceptors[self.selected_msl_idx] if self.selected_msl_idx < len(self.sim_window.interceptors) else None
+        los_direction = los / distance
+        desired_vel = los_direction * self.speed
+        self.vel = self.vel + (desired_vel - self.vel) * self.proportional_gain * TIME_STEP
+        if np.linalg.norm(self.vel) > 0:
+            self.vel = (self.vel / np.linalg.norm(self.vel)) * self.speed
 
-        # Dynamically update Ground Zero epicenter coordinates from the target of this missile index
-        tgt_pt = self.sim_window.simulation_vector_to_globe_point(active_msl.target)
-        tgt_geo = self.sim_window.unit_to_lat_lon(tgt_pt)
-        if tgt_geo:
-            self.impact_lat, self.impact_lon = tgt_geo
-            self.epicenter_lbl.config(text=f"Lat {self.impact_lat:.4f}°, Lon {self.impact_lon:.4f}°")
+        self.pos += self.vel * TIME_STEP
+        self.path.append(np.copy(self.pos))
 
-        # ------------------ TELEMETRY SWITCHBOARD ------------------
-        if self.selected_type == "interceptor" and active_intcp is not None:
-            # 1. INTERCEPTOR TELEMETRY
-            geo_alt = self.sim_window.simulation_vector_to_geo_altitude(active_intcp.pos)
-            is_active = active_intcp.active and not active_intcp.hit
-            is_launched = getattr(active_intcp, "launched", False) or is_active
-            is_hit = active_intcp.hit
+    def draw(self):
+        if not self.active:
+            return
 
-            if is_active:
-                intcp_pos = np.asarray(active_intcp.pos, dtype=float)
-                msl_pos = np.asarray(active_msl.pos, dtype=float)
-                distance_km = np.linalg.norm(intcp_pos - msl_pos) * 1000.0 # ECEF distance to missile in km
-                countdown_sec = np.linalg.norm(intcp_pos - msl_pos) / active_intcp.speed if active_intcp.speed > 1e-9 else 0.0
+        glColor3f(0.0, 0.5, 1.0)
+        glLineWidth(3.0)
+        glBegin(GL_LINE_STRIP)
+        for p in self.path:
+            glVertex3fv(p)
+        glEnd()
+        glPointSize(12.0)
+        glBegin(GL_POINTS)
+        if self.hit:
+            glColor3f(1.0, 1.0, 0.0)
+        glVertex3fv(self.pos)
+        glEnd()
+        glLineWidth(1.0)
 
-                if geo_alt is not None:
-                    lat, lon, alt = geo_alt
-                    self.msl_pos_lbl.config(text=f"Lat {lat:.2f}°, Lon {lon:.2f}°, Alt {alt:.1f} km", fg="#ffd54f")
-                else:
-                    self.msl_pos_lbl.config(text="Tracking...", fg="#ffd54f")
 
-                self.range_lbl.config(text=f"{distance_km:.2f} km")
-                self.countdown_lbl.config(text=f"{countdown_sec:.1f} s")
-                self.status_lbl.config(text="INTERCEPTOR ACTIVE / TRACKING", fg="#3498db")
-            elif is_hit:
-                if geo_alt is not None:
-                    lat, lon, alt = geo_alt
-                    self.msl_pos_lbl.config(text=f"Lat {lat:.2f}°, Lon {lon:.2f}°, Alt {alt:.1f} km (Intercepted)", fg="#2ecc71")
-                else:
-                    self.msl_pos_lbl.config(text="Intercept Successful", fg="#2ecc71")
-                self.range_lbl.config(text="0.00 km")
-                self.countdown_lbl.config(text="0.0 s")
-                self.status_lbl.config(text="INTERCEPT SUCCESSFUL", fg="#2ecc71")
-            elif not is_launched:
-                if geo_alt is not None:
-                    lat, lon, alt = geo_alt
-                    self.msl_pos_lbl.config(text=f"Lat {lat:.2f}°, Lon {lon:.2f}°, Alt {alt:.1f} km (Waiting)", fg="#ffd54f")
-                else:
-                    self.msl_pos_lbl.config(text="Offline (Waiting)", fg="#8892b0")
-                self.range_lbl.config(text="--- km")
-                self.countdown_lbl.config(text="--- s")
-                self.status_lbl.config(text="WAITING FOR LAUNCH", fg="#ffd54f")
+def draw_center_mark(display_width, display_height):
+    """Draws a tactical HUD target reticle in the exact center of the screen."""
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    gluOrtho2D(0, display_width, 0, display_height)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+    glDisable(GL_DEPTH_TEST)
+
+    cx = display_width / 2.0
+    cy = display_height / 2.0
+    gap = 4.0
+    length = 12.0
+
+    glColor3f(0.0, 1.0, 0.0)  # Tactical green reticle
+    glLineWidth(2.0)
+    glBegin(GL_LINES)
+    # Left segment
+    glVertex2f(cx - length - gap, cy)
+    glVertex2f(cx - gap, cy)
+    # Right segment
+    glVertex2f(cx + gap, cy)
+    glVertex2f(cx + length + gap, cy)
+    # Bottom segment
+    glVertex2f(cx, cy - length - gap)
+    glVertex2f(cx, cy - gap)
+    # Top segment
+    glVertex2f(cx, cy + gap)
+    glVertex2f(cx, cy + length + gap)
+    glEnd()
+
+    # Center dot
+    glPointSize(3.0)
+    glBegin(GL_POINTS)
+    glVertex2f(cx, cy)
+    glEnd()
+
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+def run_simulation(config: SimulationConfig):
+    pygame.init()
+    display = (1024, 768)
+    pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
+    pygame.display.set_caption("3D Global Missile Intercept Simulation")
+
+    glEnable(GL_DEPTH_TEST)
+
+    missile = TargetMissile(
+        start_lat=config.missile_start_lat,
+        start_lon=config.missile_start_lon,
+        start_altitude_km=config.missile_start_altitude_km,
+        target_lat=config.missile_target_lat,
+        target_lon=config.missile_target_lon,
+        target_altitude_km=config.missile_target_altitude_km,
+        speed=config.missile_speed,
+        loft_factor=config.missile_loft_factor * config.loft_vis_ratio,
+        hit_radius=config.missile_hit_radius,
+    )
+    interceptor = Interceptor(
+        start_lat=config.interceptor_start_lat,
+        start_lon=config.interceptor_start_lon,
+        start_altitude_km=config.interceptor_start_altitude_km,
+        speed=config.interceptor_speed,
+        proportional_gain=config.proportional_gain,
+        hit_radius=config.interceptor_hit_radius,
+    )
+
+    clock = pygame.time.Clock()
+    rotation_x = config.custom_view_pitch_deg
+    rotation_y = config.custom_view_yaw_deg
+    zoom = -18.0
+    fov = 45.0
+    interceptor_launched = False
+
+    camera_modes = [
+        "orbit",
+        "ground_interceptor_track",
+        "ground_interceptor_look",
+        "ground_target_track",
+        "ground_target_look",
+        "ground_missile_track",
+        "ground_missile_look",
+        "ground_custom_track",
+        "ground_custom_look"
+    ]
+    camera_mode_idx = 0
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_SPACE and not interceptor_launched:
+                    interceptor.launch()
+                    interceptor_launched = True
+                elif event.key == pygame.K_c:
+                    camera_mode_idx = (camera_mode_idx + 1) % len(camera_modes)
+                    # Reset rotation for a clean transition in local look modes
+                    if "look" in camera_modes[camera_mode_idx]:
+                        rotation_x = 0.0
+                        rotation_y = 0.0
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 4:  # Scroll Up (Zoom In)
+                    if camera_modes[camera_mode_idx] == "orbit":
+                        zoom = min(zoom + 0.8, -2.0)
+                    else:
+                        fov = max(fov - 2.0, 2.0)
+                elif event.button == 5:  # Scroll Down (Zoom Out)
+                    if camera_modes[camera_mode_idx] == "orbit":
+                        zoom = max(zoom - 0.8, -45.0)
+                    else:
+                        fov = min(fov + 2.0, 75.0)
+
+        mouse_buttons = pygame.mouse.get_pressed()
+        if mouse_buttons[0]:
+            rel_x, rel_y = pygame.mouse.get_rel()
+            if camera_modes[camera_mode_idx] == "orbit":
+                rotation_y += rel_x * 0.2
+                rotation_x += rel_y * 0.2
             else:
-                self.msl_pos_lbl.config(text="Offline", fg="#8892b0")
-                self.range_lbl.config(text="--- km")
-                self.countdown_lbl.config(text="--- s")
-                self.status_lbl.config(text="OFFLINE", fg="#8892b0")
-
-        elif self.selected_type == "target":
-            # 2. TARGET / GROUND ZERO TELEMETRY
-            geo_alt = self.sim_window.simulation_vector_to_geo_altitude(active_msl.target)
-            is_msl_active = active_msl.active
-            is_reached = getattr(active_msl, "reached_target", False)
-            is_intercepted = active_intcp is not None and getattr(active_intcp, "hit", False)
-
-            if geo_alt is not None:
-                lat, lon, alt = geo_alt
-                # Target coordinates stay static, but reflect state in parenthetical label!
-                if is_msl_active:
-                    state_suffix = "Active Threat"
-                elif is_reached:
-                    state_suffix = "Impacted"
-                elif is_intercepted:
-                    state_suffix = "Secured"
-                else:
-                    state_suffix = "Safe"
-                self.msl_pos_lbl.config(text=f"Lat {lat:.2f}°, Lon {lon:.2f}°, Alt {alt:.1f} km ({state_suffix})", fg="#2ecc71" if is_intercepted or (not is_msl_active and not is_reached) else "#e74c3c")
-            else:
-                self.msl_pos_lbl.config(text="Active Ground Zero", fg="#ffd54f")
-
-            self.range_lbl.config(text="0.00 km")
-            self.countdown_lbl.config(text="0.0 s")
-
-            if is_msl_active:
-                self.status_lbl.config(text="TARGET AREA UNDER ACTIVE THREAT", fg="#e74c3c")
-            elif is_reached:
-                self.status_lbl.config(text="GROUND ZERO IMPACT RESOLVED", fg="#c0392b")
-            elif is_intercepted:
-                self.status_lbl.config(text="TARGET AREA SECURED", fg="#2ecc71")
-            else:
-                self.status_lbl.config(text="TARGET AREA INACTIVE / SAFE", fg="#ffd54f")
-
+                rotation_y += rel_x * 0.2
+                rotation_x = max(min(rotation_x + rel_y * 0.2, 89.0), -89.0)
         else:
-            # 3. MISSILE TELEMETRY (Standard Behavior!)
-            geo_alt = self.sim_window.simulation_vector_to_geo_altitude(active_msl.pos)
-            is_active = active_msl.active
-            is_launched = getattr(active_msl, "launched", True) or is_active
-            is_neutralized = active_intcp is not None and getattr(active_intcp, "hit", False)
-            is_reached = getattr(active_msl, "reached_target", False)
+            pygame.mouse.get_rel()
 
-            if is_active:
-                msl_pos = np.asarray(active_msl.pos, dtype=float)
-                tgt_pos = np.asarray(active_msl.target, dtype=float)
-                distance_km = np.linalg.norm(msl_pos - tgt_pos) * 1000.0 # ECEF distance to target Ground Zero in km
-                countdown_sec = np.linalg.norm(msl_pos - tgt_pos) / active_msl.speed if active_msl.speed > 1e-9 else 0.0
+        target_hit = missile.update()
+        if target_hit:
+            print("Intercept failed!")
+            interceptor.active = False
+            interceptor.vel[:] = 0.0
+        required_steps = int(config.interceptor_delay_sec / TIME_STEP)
+        if config.auto_launch_interceptor and missile.active and len(missile.path) > required_steps and not interceptor_launched:
+            interceptor.launch()
+            interceptor_launched = True
+        if interceptor_launched and missile.active:
+            interceptor.update(missile.pos)
+            if interceptor.hit:
+                missile.active = False
 
-                if geo_alt is not None:
-                    lat, lon, alt = geo_alt
-                    self.msl_pos_lbl.config(text=f"Lat {lat:.2f}°, Lon {lon:.2f}°, Alt {alt:.1f} km", fg="#ffd54f")
-                else:
-                    self.msl_pos_lbl.config(text="Calculating...", fg="#8892b0")
+        # Update projection matrix dynamically for zoom/FOV changes
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(fov, display[0] / display[1], 0.001, 100.0)
+        glMatrixMode(GL_MODELVIEW)
 
-                self.range_lbl.config(text=f"{distance_km:.2f} km")
-                self.countdown_lbl.config(text=f"{countdown_sec:.1f} s")
-                self.status_lbl.config(text="TRACKING ACTIVE THREAT", fg="#e74c3c")
-            elif is_neutralized:
-                if geo_alt is not None:
-                    lat, lon, alt = geo_alt
-                    self.msl_pos_lbl.config(text=f"Lat {lat:.2f}°, Lon {lon:.2f}°, Alt {alt:.1f} km (Intercepted)", fg="#2ecc71")
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glLoadIdentity()
+
+        camera_mode = camera_modes[camera_mode_idx]
+        if camera_mode == "orbit":
+            glTranslatef(0.0, 0.0, zoom)
+            glRotatef(rotation_x, 1, 0, 0)
+            glRotatef(rotation_y, 0, 1, 0)
+        else:
+            # Identify ground camera station coordinates
+            if "interceptor" in camera_mode:
+                cam_lat = config.interceptor_start_lat
+                cam_lon = config.interceptor_start_lon
+                cam_alt = 10.0
+            elif "target" in camera_mode:
+                cam_lat = config.missile_target_lat
+                cam_lon = config.missile_target_lon
+                cam_alt = 10.0
+            elif "custom" in camera_mode:
+                cam_lat = config.custom_cam_lat
+                cam_lon = config.custom_cam_lon
+                cam_alt = config.custom_cam_altitude_km
+            else:  # "missile"
+                cam_lat = config.missile_start_lat
+                cam_lon = config.missile_start_lon
+                cam_alt = 10.0
+
+            # Position camera slightly above surface to avoid near clipping
+            eye = lat_lon_to_xyz(cam_lat, cam_lon, radius=EARTH_RADIUS, altitude_km=cam_alt)
+            up = eye / np.linalg.norm(eye)
+
+            # Compute local East and North basis vectors at this location
+            theta_rad = math.radians(cam_lon)
+            east = np.array([-math.sin(theta_rad), 0.0, math.cos(theta_rad)], dtype=float)
+            east_norm = np.linalg.norm(east)
+            if east_norm > 1e-9:
+                east /= east_norm
+            north = np.cross(east, up)
+            north_norm = np.linalg.norm(north)
+            if north_norm > 1e-9:
+                north /= north_norm
+
+            if "track" in camera_mode:
+                # Automatically track the active threat or interceptor
+                if missile.active:
+                    center = missile.pos
+                elif interceptor.active:
+                    center = interceptor.pos
                 else:
-                    self.msl_pos_lbl.config(text="Intercepted", fg="#2ecc71")
-                self.range_lbl.config(text="0.00 km")
-                self.countdown_lbl.config(text="0.0 s")
-                self.status_lbl.config(text="THREAT NEUTRALIZED", fg="#2ecc71")
-            elif is_reached:
-                if geo_alt is not None:
-                    lat, lon, alt = geo_alt
-                    self.msl_pos_lbl.config(text=f"Lat {lat:.2f}°, Lon {lon:.2f}°, Alt {alt:.1f} km (Detonated)", fg="#c0392b")
-                else:
-                    self.msl_pos_lbl.config(text="Impacted", fg="#c0392b")
-                self.range_lbl.config(text="0.00 km")
-                self.countdown_lbl.config(text="0.0 s")
-                self.status_lbl.config(text="IMPACT / DETONATION", fg="#c0392b")
+                    center = lat_lon_to_xyz(config.missile_target_lat, config.missile_target_lon, radius=EARTH_RADIUS)
             else:
-                if geo_alt is not None:
-                    lat, lon, alt = geo_alt
-                    self.msl_pos_lbl.config(text=f"Lat {lat:.2f}°, Lon {lon:.2f}°, Alt {alt:.1f} km (Waiting)", fg="#ffd54f")
-                else:
-                    self.msl_pos_lbl.config(text="Offline (Waiting)", fg="#8892b0")
-                self.range_lbl.config(text="--- km")
-                self.countdown_lbl.config(text="--- s")
-                self.status_lbl.config(text="WAITING FOR LAUNCH", fg="#ffd54f")
-
-        # ------------------ DYNAMIC MAP UPDATE / RECORDINGS TRIGGER ------------------
-        # Rate-limit and save live_data.json dynamically (every 250ms!)
-        current_time = time.time()
-        if current_time - self.last_map_update_time >= 0.25:
-            self.last_map_update_time = current_time
-            
-            # Take snapshot on main thread
-            snap = snapshot_sim_data(self.sim_window, self.geo_path_cache, self.selected_msl_idx, self.go_trigger_time, self.selected_type)
-            
-            # Save live_data.json atomically and instantaneously
-            save_json_atomic(snap, "live_data.json")
-
-    def save_window_settings(self):
-        try:
-            import json
-            # Get geometry string, e.g. "560x650+100+100"
-            geom = self.geometry()
-            parts = geom.split("+")
-            if len(parts) == 3:
-                size_part = parts[0]
-                x = int(parts[1])
-                y = int(parts[2])
+                # Look freely with yaw and pitch relative to the local horizon
+                yaw_rad = math.radians(rotation_y)
+                pitch_rad = math.radians(max(min(rotation_x, 89.0), -89.0))
                 
-                size_parts = size_part.split("x")
-                if len(size_parts) == 2:
-                    width = int(size_parts[0])
-                    height = int(size_parts[1])
-                    
-                    # Prevent saving minimized or sentinel coordinates (e.g. -32000)
-                    # We use -15000 to allow valid negative coordinates in multi-monitor setups (e.g. -1920)
-                    if x >= -15000 and y >= -15000 and width >= 100 and height >= 100:
-                        settings = {
-                            "width": width,
-                            "height": height,
-                            "x": x,
-                            "y": y
-                        }
-                        with open("impact_window_settings.json", "w") as f:
-                            json.dump(settings, f)
-        except Exception as e:
-            print("Error saving impact window settings:", e)
+                look_horizontal = math.cos(yaw_rad) * north + math.sin(yaw_rad) * east
+                local_look = math.cos(pitch_rad) * look_horizontal + math.sin(pitch_rad) * up
+                center = eye + local_look
 
-    def load_window_settings(self):
-        try:
-            import json
-            import os
-            if os.path.exists("impact_window_settings.json"):
-                with open("impact_window_settings.json", "r") as f:
-                    settings = json.load(f)
-                    
-                width = settings.get("width", 560)
-                height = settings.get("height", 650)
-                x = settings.get("x")
-                y = settings.get("y")
-                
-                if x is not None and y is not None and int(x) >= -15000 and int(y) >= -15000:
-                    self.geometry(f"{width}x{height}+{x}+{y}")
-                else:
-                    self.geometry(f"{width}x{height}")
-            else:
-                self.geometry("560x650")
-        except Exception as e:
-            print("Error loading impact window settings:", e)
-            self.geometry("560x650")
+            gluLookAt(eye[0], eye[1], eye[2], center[0], center[1], center[2], up[0], up[1], up[2])
 
-    def on_close(self):
-        self.save_window_settings()
-        self.destroy()
+        draw_sphere(EARTH_RADIUS)
+        draw_location_marker(config.missile_start_lat, config.missile_start_lon, (1.0, 0.25, 0.25), altitude_km=config.missile_start_altitude_km, radius_scale=1.05)
+        draw_location_marker(config.missile_target_lat, config.missile_target_lon, (1.0, 0.85, 0.15), altitude_km=config.missile_target_altitude_km, radius_scale=1.05)
+        draw_location_marker(config.interceptor_start_lat, config.interceptor_start_lon, (0.1, 0.85, 0.65), altitude_km=config.interceptor_start_altitude_km, radius_scale=1.05)
+        
+        # Render threat paths as tactical overlay (always visible through/over the globe curvature from the ground)
+        glDisable(GL_DEPTH_TEST)
+        missile.draw()
+        interceptor.draw()
+        glEnable(GL_DEPTH_TEST)
+
+        # Draw the tactical HUD center mark over the screen
+        draw_center_mark(display[0], display[1])
+
+        # Update caption with camera mode status
+        mode_str = {
+            "orbit": "Orbit View",
+            "ground_interceptor_track": "Ground Camera (Intcp Site) - Tracking Missile",
+            "ground_interceptor_look": "Ground Camera (Intcp Site) - Looking around",
+            "ground_target_track": "Ground Camera (Target Site) - Tracking Missile",
+            "ground_target_look": "Ground Camera (Target Site) - Looking around",
+            "ground_missile_track": "Ground Camera (Missile Launch) - Tracking",
+            "ground_missile_look": "Ground Camera (Missile Launch) - Looking around",
+            "ground_custom_track": "Ground Camera (Custom Site) - Tracking Missile",
+            "ground_custom_look": "Ground Camera (Custom Site) - Looking around",
+        }.get(camera_mode, "Orbit View")
+        pygame.display.set_caption(f"3D Global Missile Intercept Simulation | View: {mode_str} | Press 'C' to Cycle | Scroll to Zoom")
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.quit()
+
+
+def load_simulation_settings():
+    """Loads custom settings from the Tkinter GUI settings file."""
+    settings_file = os.path.join(os.path.dirname(__file__), "mslwarntest_settings.json")
+    try:
+        with open(settings_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    return data
+
+
+def main():
+    data = load_simulation_settings()
+    config = SimulationConfig(
+        missile_speed=float(data.get("missile_speed", 5.0)) / 1000.0,
+        interceptor_speed=float(data.get("interceptor_speed", 7.0)) / 1000.0,
+        proportional_gain=float(data.get("proportional_gain", 4.0)),
+        auto_launch_interceptor=bool(data.get("auto_launch_interceptor", True)),
+        missile_start_lat=float(data.get("missile_start_lat", 39.0)),
+        missile_start_lon=float(data.get("missile_start_lon", 125.0)),
+        missile_start_altitude_km=float(data.get("missile_start_altitude_km", 0.0)),
+        missile_target_lat=float(data.get("missile_target_lat", 38.0)),
+        missile_target_lon=float(data.get("missile_target_lon", -77.0)),
+        missile_target_altitude_km=float(data.get("missile_target_altitude_km", 0.0)),
+        interceptor_start_lat=float(data.get("interceptor_start_lat", 64.0)),
+        interceptor_start_lon=float(data.get("interceptor_start_lon", -147.0)),
+        interceptor_start_altitude_km=float(data.get("interceptor_start_altitude_km", 0.0)),
+        interceptor_delay_sec=float(data.get("interceptor_delay_sec", 3.0)),
+        custom_cam_lat=float(data.get("view_center_lat", 38.54)),
+        custom_cam_lon=float(data.get("view_center_lon", 100.74)),
+        custom_cam_altitude_km=float(data.get("view_altitude_km", 0.5)),
+        custom_view_yaw_deg=float(data.get("view_yaw_deg", 169.26)),
+        custom_view_pitch_deg=float(data.get("view_pitch_deg", 38.54)),
+        missile_loft_factor=float(data.get("simulation_missile_loft_factor", 0.8)),
+        missile_hit_radius=float(data.get("simulation_missile_hit_radius", 0.0015)),
+        interceptor_hit_radius=float(data.get("simulation_interceptor_hit_radius", 0.003)),
+        loft_vis_ratio=float(data.get("simulation_loft_vis_ratio", 1.0)),
+    )
+    run_simulation(config)
+
 
 if __name__ == "__main__":
-    # Standard fallback test
-    import sys
-    if len(sys.argv) == 3:
-        impact_lat, impact_lon = float(sys.argv[1]), float(sys.argv[2]) 
-    else:   
-        # Center map around the target
-        impact_lat, impact_lon = 34.1425, -117.9048
-
-    update_map_file(impact_lat, impact_lon)
-
+    main()
